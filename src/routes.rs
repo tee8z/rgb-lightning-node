@@ -864,12 +864,15 @@ pub(crate) struct MakerInitRequest {
     pub(crate) from_asset: Option<String>,
     pub(crate) to_asset: Option<String>,
     pub(crate) timeout_sec: u32,
+    pub(crate) payment_hash: Option<String>,
+    pub(crate) payment_preimage: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct MakerInitResponse {
     pub(crate) payment_hash: String,
     pub(crate) payment_secret: String,
+    pub(crate) payment_preimage: Option<String>,
     pub(crate) swapstring: String,
 }
 
@@ -2864,9 +2867,16 @@ pub(crate) async fn maker_execute(
         }
 
         let payment_preimage = unlocked_state
-            .channel_manager
-            .get_payment_preimage(swapstring.payment_hash, payment_secret)
-            .map_err(|_| APIError::MissingSwapPaymentPreimage)?;
+            .maker_swaps()
+            .get(&swapstring.payment_hash)
+            .and_then(|swap| swap.payment_preimage)
+            .or_else(|| {
+                unlocked_state
+                    .channel_manager
+                    .get_payment_preimage(swapstring.payment_hash, payment_secret)
+                    .ok()
+            })
+            .ok_or(APIError::MissingSwapPaymentPreimage)?;
 
         let swap_info = swapstring.swap_info;
 
@@ -3056,6 +3066,24 @@ pub(crate) async fn maker_execute(
     .await
 }
 
+fn parse_payment_hash(value: &str) -> Result<PaymentHash, APIError> {
+    hex_str_to_vec(value)
+        .and_then(|data| data.try_into().ok())
+        .map(PaymentHash)
+        .ok_or_else(|| APIError::InvalidPaymentHash(value.to_string()))
+}
+
+fn parse_payment_preimage(value: &str) -> Result<PaymentPreimage, APIError> {
+    hex_str_to_vec(value)
+        .and_then(|data| data.try_into().ok())
+        .map(PaymentPreimage)
+        .ok_or_else(|| APIError::InvalidRequest(s!("invalid payment_preimage")))
+}
+
+fn payment_hash_from_preimage(payment_preimage: &PaymentPreimage) -> PaymentHash {
+    PaymentHash(Sha256::hash(&payment_preimage.0).to_byte_array())
+}
+
 pub(crate) async fn maker_init(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<MakerInitRequest>, APIError>,
@@ -3099,7 +3127,44 @@ pub(crate) async fn maker_init(
             qty_to,
             expiry,
         };
-        let swap_data = SwapData::create_from_swap_info(&swap_info);
+        let requested_payment_hash = payload
+            .payment_hash
+            .as_deref()
+            .map(parse_payment_hash)
+            .transpose()?;
+        let requested_payment_preimage = payload
+            .payment_preimage
+            .as_deref()
+            .map(parse_payment_preimage)
+            .transpose()?;
+        let requested_payment_hash = match (requested_payment_hash, requested_payment_preimage) {
+            (Some(payment_hash), Some(payment_preimage)) => {
+                let derived_hash = payment_hash_from_preimage(&payment_preimage);
+                if derived_hash != payment_hash {
+                    return Err(APIError::InvalidSwap(s!(
+                        "payment_preimage does not match payment_hash"
+                    )));
+                }
+                Some((payment_hash, payment_preimage))
+            }
+            (None, Some(payment_preimage)) => Some((
+                payment_hash_from_preimage(&payment_preimage),
+                payment_preimage,
+            )),
+            (Some(_), None) => {
+                return Err(APIError::InvalidSwap(s!(
+                    "payment_preimage is required when payment_hash is supplied"
+                )));
+            }
+            (None, None) => None,
+        };
+
+        let swap_data = SwapData::create_from_swap_info_with_preimage(
+            &swap_info,
+            requested_payment_hash
+                .as_ref()
+                .map(|(_, preimage)| *preimage),
+        );
 
         // Check that we have enough assets to send
         if let Some(to_asset) = to_asset {
@@ -3113,10 +3178,25 @@ pub(crate) async fn maker_init(
             }
         }
 
-        let (payment_hash, payment_secret) = unlocked_state
-            .channel_manager
-            .create_inbound_payment(Some(DUST_LIMIT_MSAT), payload.timeout_sec, None)
-            .unwrap();
+        let (payment_hash, payment_secret, payment_preimage) =
+            if let Some((payment_hash, payment_preimage)) = requested_payment_hash {
+                let payment_secret = unlocked_state
+                    .channel_manager
+                    .create_inbound_payment_for_hash(
+                        payment_hash,
+                        Some(DUST_LIMIT_MSAT),
+                        payload.timeout_sec,
+                        None,
+                    )
+                    .unwrap();
+                (payment_hash, payment_secret, Some(payment_preimage))
+            } else {
+                let (payment_hash, payment_secret) = unlocked_state
+                    .channel_manager
+                    .create_inbound_payment(Some(DUST_LIMIT_MSAT), payload.timeout_sec, None)
+                    .unwrap();
+                (payment_hash, payment_secret, None)
+            };
         unlocked_state.add_maker_swap(payment_hash, swap_data);
 
         let swapstring = SwapString::from_swap_info(&swap_info, payment_hash).to_string();
@@ -3126,6 +3206,7 @@ pub(crate) async fn maker_init(
         Ok(Json(MakerInitResponse {
             payment_hash,
             payment_secret,
+            payment_preimage: payment_preimage.map(|p| hex_str(&p.0)),
             swapstring,
         }))
     })

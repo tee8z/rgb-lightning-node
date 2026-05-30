@@ -915,10 +915,21 @@ async fn handle_ldk_events(
                     payment_preimage, ..
                 } => payment_preimage,
                 PaymentPurpose::SpontaneousPayment(preimage) => Some(preimage),
+            }
+            .or_else(|| {
+                unlocked_state
+                    .maker_swaps()
+                    .get(&payment_hash)
+                    .and_then(|swap| swap.payment_preimage)
+            });
+            let Some(payment_preimage) = payment_preimage else {
+                tracing::error!(
+                    "ERROR: received claimable payment for hash {} without a known preimage",
+                    payment_hash
+                );
+                return Ok(());
             };
-            unlocked_state
-                .channel_manager
-                .claim_funds(payment_preimage.unwrap());
+            unlocked_state.channel_manager.claim_funds(payment_preimage);
         }
         Event::PaymentClaimed {
             payment_hash,
