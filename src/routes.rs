@@ -20,7 +20,7 @@ use lightning::rgb_utils::{
 use lightning::routing::gossip::RoutingFees;
 use lightning::routing::router::{Path as LnPath, Route, RouteHint, RouteHintHop};
 use lightning::sign::EntropySource;
-use lightning::util::config::ChannelConfig;
+use lightning::util::config::{ChannelConfig, MaxDustHTLCExposure};
 use lightning::{chain::channelmonitor::Balance, impl_writeable_tlv_based_enum};
 use lightning::{
     ln::channel_state::ChannelShutdownState, onion_message::messenger::MessageSendInstructions,
@@ -98,17 +98,21 @@ use crate::{
 
 const UTXO_NUM: u8 = 4;
 
-pub(crate) const HTLC_MIN_MSAT: u64 = 3000000;
-pub(crate) const MAX_SWAP_FEE_MSAT: u64 = HTLC_MIN_MSAT;
+pub(crate) const VANILLA_HTLC_MIN_MSAT: u64 = 1;
+pub(crate) const RGB_HTLC_MIN_MSAT: u64 = 3_000_000;
+#[cfg(test)]
+pub(crate) const HTLC_MIN_MSAT: u64 = RGB_HTLC_MIN_MSAT;
+pub(crate) const MAX_DUST_HTLC_EXPOSURE_MSAT: u64 = 10_000_000;
+pub(crate) const MAX_SWAP_FEE_MSAT: u64 = RGB_HTLC_MIN_MSAT;
 
-const OPENRGBCHANNEL_MIN_SAT: u64 = HTLC_MIN_MSAT / 1000 * 10 + 10;
+const OPENRGBCHANNEL_MIN_SAT: u64 = RGB_HTLC_MIN_MSAT / 1000 * 10 + 10;
 const OPENCHANNEL_MIN_SAT: u64 = 5506;
 const OPENCHANNEL_MAX_SAT: u64 = 16777215;
 const OPENCHANNEL_MIN_RGB_AMT: u64 = 1;
 
 pub const DUST_LIMIT_MSAT: u64 = 546000;
 
-const INVOICE_MIN_MSAT: u64 = HTLC_MIN_MSAT;
+const INVOICE_MIN_MSAT: u64 = RGB_HTLC_MIN_MSAT;
 
 pub(crate) const DEFAULT_FINAL_CLTV_EXPIRY_DELTA: u32 = 14;
 
@@ -2238,19 +2242,6 @@ pub(crate) async fn keysend(
             None => return Err(APIError::InvalidPubkey),
         };
 
-        let amt_msat = payload.amt_msat;
-        if amt_msat < HTLC_MIN_MSAT {
-            return Err(APIError::InvalidAmount(format!(
-                "amt_msat cannot be less than {HTLC_MIN_MSAT}"
-            )));
-        }
-
-        let payment_preimage =
-            PaymentPreimage(unlocked_state.keys_manager.get_secure_random_bytes());
-        let payment_hash_inner = Sha256::hash(&payment_preimage.0[..]).to_byte_array();
-        let payment_id = PaymentId(payment_hash_inner);
-        let payment_hash = PaymentHash(payment_hash_inner);
-
         let rgb_payment = match (payload.asset_id, payload.asset_amount) {
             (Some(asset_id), Some(rgb_amount)) => {
                 let contract_id = ContractId::from_str(&asset_id)
@@ -2262,6 +2253,24 @@ pub(crate) async fn keysend(
                 return Err(APIError::IncompleteRGBInfo);
             }
         };
+
+        let amt_msat = payload.amt_msat;
+        let min_msat = if rgb_payment.is_some() {
+            RGB_HTLC_MIN_MSAT
+        } else {
+            VANILLA_HTLC_MIN_MSAT
+        };
+        if amt_msat < min_msat {
+            return Err(APIError::InvalidAmount(format!(
+                "amt_msat cannot be less than {min_msat}"
+            )));
+        }
+
+        let payment_preimage =
+            PaymentPreimage(unlocked_state.keys_manager.get_secure_random_bytes());
+        let payment_hash_inner = Sha256::hash(&payment_preimage.0[..]).to_byte_array();
+        let payment_id = PaymentId(payment_hash_inner);
+        let payment_hash = PaymentHash(payment_hash_inner);
 
         let route_params = RouteParameters::from_payment_params_and_value(
             PaymentParameters::for_keysend(dest_pubkey, 40, false),
@@ -2905,9 +2914,9 @@ pub(crate) async fn maker_execute(
             unlocked_state.channel_manager.get_our_node_id(),
             taker_pk,
             if swap_info.is_to_btc() {
-                Some(swap_info.qty_to + HTLC_MIN_MSAT)
+                Some(swap_info.qty_to + RGB_HTLC_MIN_MSAT)
             } else {
-                Some(HTLC_MIN_MSAT)
+                Some(RGB_HTLC_MIN_MSAT)
             },
             rgb_payment,
             vec![],
@@ -2923,9 +2932,9 @@ pub(crate) async fn maker_execute(
             taker_pk,
             unlocked_state.channel_manager.get_our_node_id(),
             if swap_info.is_to_btc() || swap_info.is_asset_asset() {
-                Some(HTLC_MIN_MSAT)
+                Some(RGB_HTLC_MIN_MSAT)
             } else {
-                Some(swap_info.qty_from + HTLC_MIN_MSAT)
+                Some(swap_info.qty_from + RGB_HTLC_MIN_MSAT)
             },
             rgb_payment,
             receive_hints,
@@ -3186,7 +3195,7 @@ pub(crate) async fn node_info(
         account_xpub_vanilla: unlocked_state.rgb_get_keys().account_xpub_vanilla,
         account_xpub_colored: unlocked_state.rgb_get_keys().account_xpub_colored,
         max_media_upload_size_mb: state.static_state.max_media_upload_size_mb,
-        rgb_htlc_min_msat: HTLC_MIN_MSAT,
+        rgb_htlc_min_msat: RGB_HTLC_MIN_MSAT,
         rgb_channel_capacity_min_sat: OPENRGBCHANNEL_MIN_SAT,
         channel_capacity_min_sat: OPENCHANNEL_MIN_SAT,
         channel_capacity_max_sat: OPENCHANNEL_MAX_SAT,
@@ -3312,6 +3321,13 @@ pub(crate) async fn open_channel(
         if let Some(fee_proportional_millionths) = payload.fee_proportional_millionths {
             channel_config.forwarding_fee_proportional_millionths = fee_proportional_millionths;
         }
+        channel_config.max_dust_htlc_exposure =
+            MaxDustHTLCExposure::FixedLimitMsat(MAX_DUST_HTLC_EXPOSURE_MSAT);
+        let htlc_minimum_msat = if colored_info.is_some() {
+            RGB_HTLC_MIN_MSAT
+        } else {
+            VANILLA_HTLC_MIN_MSAT
+        };
         let config = UserConfig {
             channel_handshake_limits: ChannelHandshakeLimits {
                 // lnd's max to_self_delay is 2016, so we want to be compatible.
@@ -3320,7 +3336,7 @@ pub(crate) async fn open_channel(
             },
             channel_handshake_config: ChannelHandshakeConfig {
                 announce_for_forwarding: payload.public,
-                our_htlc_minimum_msat: HTLC_MIN_MSAT,
+                our_htlc_minimum_msat: htlc_minimum_msat,
                 minimum_depth: MIN_CHANNEL_CONFIRMATIONS as u32,
                 negotiate_anchors_zero_fee_htlc_tx: payload.with_anchors,
                 ..Default::default()
