@@ -1409,18 +1409,37 @@ async fn handle_ldk_events(
                 })
             };
 
-            let inbound_channel = unlocked_state
-                .channel_manager
-                .list_channels()
-                .into_iter()
+            let channels = unlocked_state.channel_manager.list_channels();
+            let Some(inbound_channel) = channels
+                .iter()
                 .find(|details| details.outbound_scid_alias == Some(prev_outbound_scid_alias))
-                .expect("Should always be a valid channel");
-            let outbound_channel = unlocked_state
-                .channel_manager
-                .list_channels()
-                .into_iter()
-                .find(|details| details.short_channel_id == Some(requested_next_hop_scid))
-                .expect("Should always be a valid channel");
+            else {
+                tracing::error!(
+                    "ERROR: rejecting swap HTLC with unknown inbound alias {} for payment hash {}",
+                    prev_outbound_scid_alias,
+                    payment_hash
+                );
+                unlocked_state
+                    .channel_manager
+                    .fail_intercepted_htlc(intercept_id)
+                    .unwrap();
+                return Ok(());
+            };
+            let Some(outbound_channel) = channels.iter().find(|details| {
+                details.short_channel_id == Some(requested_next_hop_scid)
+                    || details.outbound_scid_alias == Some(requested_next_hop_scid)
+            }) else {
+                tracing::error!(
+                    "ERROR: rejecting swap HTLC with unknown outbound SCID or alias {} for payment hash {}",
+                    requested_next_hop_scid,
+                    payment_hash
+                );
+                unlocked_state
+                    .channel_manager
+                    .fail_intercepted_htlc(intercept_id)
+                    .unwrap();
+                return Ok(());
+            };
 
             let inbound_rgb_info = get_rgb_info(&inbound_channel.channel_id);
             let outbound_rgb_info = get_rgb_info(&outbound_channel.channel_id);
