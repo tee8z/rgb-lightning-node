@@ -37,7 +37,10 @@ use lightning::sign::{
     SpendableOutputDescriptor,
 };
 use lightning::types::payment::{PaymentHash, PaymentPreimage};
-use lightning::util::config::UserConfig;
+use lightning::util::config::{
+    ChannelConfigOverrides, ChannelConfigUpdate, ChannelHandshakeConfigUpdate, MaxDustHTLCExposure,
+    UserConfig,
+};
 use lightning::util::hash_tables::hash_map::Entry;
 use lightning::util::hash_tables::HashMap as LdkHashMap;
 use lightning::util::persist::{
@@ -100,7 +103,10 @@ use crate::disk::{
 };
 use crate::error::APIError;
 use crate::rgb::{check_rgb_proxy_endpoint, get_rgb_channel_info_optional, RgbLibWalletWrapper};
-use crate::routes::{HTLCStatus, SwapStatus, UnlockRequest, DUST_LIMIT_MSAT};
+use crate::routes::{
+    HTLCStatus, SwapStatus, UnlockRequest, DUST_LIMIT_MSAT, MAX_DUST_HTLC_EXPOSURE_MSAT,
+    VANILLA_HTLC_MIN_MSAT,
+};
 use crate::swap::SwapData;
 use crate::utils::{
     check_port_is_available, connect_peer_if_necessary, do_connect_peer, get_current_timestamp,
@@ -909,10 +915,21 @@ async fn handle_ldk_events(
                     payment_preimage, ..
                 } => payment_preimage,
                 PaymentPurpose::SpontaneousPayment(preimage) => Some(preimage),
+            }
+            .or_else(|| {
+                unlocked_state
+                    .maker_swaps()
+                    .get(&payment_hash)
+                    .and_then(|swap| swap.payment_preimage)
+            });
+            let Some(payment_preimage) = payment_preimage else {
+                tracing::error!(
+                    "ERROR: received claimable payment for hash {} without a known preimage",
+                    payment_hash
+                );
+                return Ok(());
             };
-            unlocked_state
-                .channel_manager
-                .claim_funds(payment_preimage.unwrap());
+            unlocked_state.channel_manager.claim_funds(payment_preimage);
         }
         Event::PaymentClaimed {
             payment_hash,
@@ -1041,11 +1058,23 @@ async fn handle_ldk_events(
             random_bytes
                 .copy_from_slice(&unlocked_state.keys_manager.get_secure_random_bytes()[..16]);
             let user_channel_id = u128::from_be_bytes(random_bytes);
+            let config_overrides = ChannelConfigOverrides {
+                handshake_overrides: Some(ChannelHandshakeConfigUpdate {
+                    htlc_minimum_msat: Some(VANILLA_HTLC_MIN_MSAT),
+                    ..Default::default()
+                }),
+                update_overrides: Some(ChannelConfigUpdate {
+                    max_dust_htlc_exposure_msat: Some(MaxDustHTLCExposure::FixedLimitMsat(
+                        MAX_DUST_HTLC_EXPOSURE_MSAT,
+                    )),
+                    ..Default::default()
+                }),
+            };
             let res = unlocked_state.channel_manager.accept_inbound_channel(
                 temporary_channel_id,
                 counterparty_node_id,
                 user_channel_id,
-                None,
+                Some(config_overrides),
             );
 
             if let Err(e) = res {
@@ -1380,18 +1409,37 @@ async fn handle_ldk_events(
                 })
             };
 
-            let inbound_channel = unlocked_state
-                .channel_manager
-                .list_channels()
-                .into_iter()
+            let channels = unlocked_state.channel_manager.list_channels();
+            let Some(inbound_channel) = channels
+                .iter()
                 .find(|details| details.outbound_scid_alias == Some(prev_outbound_scid_alias))
-                .expect("Should always be a valid channel");
-            let outbound_channel = unlocked_state
-                .channel_manager
-                .list_channels()
-                .into_iter()
-                .find(|details| details.short_channel_id == Some(requested_next_hop_scid))
-                .expect("Should always be a valid channel");
+            else {
+                tracing::error!(
+                    "ERROR: rejecting swap HTLC with unknown inbound alias {} for payment hash {}",
+                    prev_outbound_scid_alias,
+                    payment_hash
+                );
+                unlocked_state
+                    .channel_manager
+                    .fail_intercepted_htlc(intercept_id)
+                    .unwrap();
+                return Ok(());
+            };
+            let Some(outbound_channel) = channels.iter().find(|details| {
+                details.short_channel_id == Some(requested_next_hop_scid)
+                    || details.outbound_scid_alias == Some(requested_next_hop_scid)
+            }) else {
+                tracing::error!(
+                    "ERROR: rejecting swap HTLC with unknown outbound SCID or alias {} for payment hash {}",
+                    requested_next_hop_scid,
+                    payment_hash
+                );
+                unlocked_state
+                    .channel_manager
+                    .fail_intercepted_htlc(intercept_id)
+                    .unwrap();
+                return Ok(());
+            };
 
             let inbound_rgb_info = get_rgb_info(&inbound_channel.channel_id);
             let outbound_rgb_info = get_rgb_info(&outbound_channel.channel_id);
@@ -1921,9 +1969,12 @@ pub(crate) async fn start_ldk(
     user_config
         .channel_handshake_limits
         .force_announced_channel_preference = false;
+    user_config.channel_handshake_config.our_htlc_minimum_msat = VANILLA_HTLC_MIN_MSAT;
     user_config
         .channel_handshake_config
         .negotiate_anchors_zero_fee_htlc_tx = true;
+    user_config.channel_config.max_dust_htlc_exposure =
+        MaxDustHTLCExposure::FixedLimitMsat(MAX_DUST_HTLC_EXPOSURE_MSAT);
     user_config.manually_accept_inbound_channels = true;
     let mut restarting_node = true;
     let (channel_manager_blockhash, channel_manager) = {

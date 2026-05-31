@@ -20,7 +20,7 @@ use lightning::rgb_utils::{
 use lightning::routing::gossip::RoutingFees;
 use lightning::routing::router::{Path as LnPath, Route, RouteHint, RouteHintHop};
 use lightning::sign::EntropySource;
-use lightning::util::config::ChannelConfig;
+use lightning::util::config::{ChannelConfig, MaxDustHTLCExposure};
 use lightning::{chain::channelmonitor::Balance, impl_writeable_tlv_based_enum};
 use lightning::{
     ln::channel_state::ChannelShutdownState, onion_message::messenger::MessageSendInstructions,
@@ -98,17 +98,21 @@ use crate::{
 
 const UTXO_NUM: u8 = 4;
 
-pub(crate) const HTLC_MIN_MSAT: u64 = 3000000;
-pub(crate) const MAX_SWAP_FEE_MSAT: u64 = HTLC_MIN_MSAT;
+pub(crate) const VANILLA_HTLC_MIN_MSAT: u64 = 1;
+pub(crate) const RGB_HTLC_MIN_MSAT: u64 = 3_000_000;
+#[cfg(test)]
+pub(crate) const HTLC_MIN_MSAT: u64 = RGB_HTLC_MIN_MSAT;
+pub(crate) const MAX_DUST_HTLC_EXPOSURE_MSAT: u64 = 10_000_000;
+pub(crate) const MAX_SWAP_FEE_MSAT: u64 = RGB_HTLC_MIN_MSAT;
 
-const OPENRGBCHANNEL_MIN_SAT: u64 = HTLC_MIN_MSAT / 1000 * 10 + 10;
+const OPENRGBCHANNEL_MIN_SAT: u64 = RGB_HTLC_MIN_MSAT / 1000 * 10 + 10;
 const OPENCHANNEL_MIN_SAT: u64 = 5506;
 const OPENCHANNEL_MAX_SAT: u64 = 16777215;
 const OPENCHANNEL_MIN_RGB_AMT: u64 = 1;
 
 pub const DUST_LIMIT_MSAT: u64 = 546000;
 
-const INVOICE_MIN_MSAT: u64 = HTLC_MIN_MSAT;
+const INVOICE_MIN_MSAT: u64 = RGB_HTLC_MIN_MSAT;
 
 pub(crate) const DEFAULT_FINAL_CLTV_EXPIRY_DELTA: u32 = 14;
 
@@ -860,12 +864,15 @@ pub(crate) struct MakerInitRequest {
     pub(crate) from_asset: Option<String>,
     pub(crate) to_asset: Option<String>,
     pub(crate) timeout_sec: u32,
+    pub(crate) payment_hash: Option<String>,
+    pub(crate) payment_preimage: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct MakerInitResponse {
     pub(crate) payment_hash: String,
     pub(crate) payment_secret: String,
+    pub(crate) payment_preimage: Option<String>,
     pub(crate) swapstring: String,
 }
 
@@ -2238,19 +2245,6 @@ pub(crate) async fn keysend(
             None => return Err(APIError::InvalidPubkey),
         };
 
-        let amt_msat = payload.amt_msat;
-        if amt_msat < HTLC_MIN_MSAT {
-            return Err(APIError::InvalidAmount(format!(
-                "amt_msat cannot be less than {HTLC_MIN_MSAT}"
-            )));
-        }
-
-        let payment_preimage =
-            PaymentPreimage(unlocked_state.keys_manager.get_secure_random_bytes());
-        let payment_hash_inner = Sha256::hash(&payment_preimage.0[..]).to_byte_array();
-        let payment_id = PaymentId(payment_hash_inner);
-        let payment_hash = PaymentHash(payment_hash_inner);
-
         let rgb_payment = match (payload.asset_id, payload.asset_amount) {
             (Some(asset_id), Some(rgb_amount)) => {
                 let contract_id = ContractId::from_str(&asset_id)
@@ -2262,6 +2256,24 @@ pub(crate) async fn keysend(
                 return Err(APIError::IncompleteRGBInfo);
             }
         };
+
+        let amt_msat = payload.amt_msat;
+        let min_msat = if rgb_payment.is_some() {
+            RGB_HTLC_MIN_MSAT
+        } else {
+            VANILLA_HTLC_MIN_MSAT
+        };
+        if amt_msat < min_msat {
+            return Err(APIError::InvalidAmount(format!(
+                "amt_msat cannot be less than {min_msat}"
+            )));
+        }
+
+        let payment_preimage =
+            PaymentPreimage(unlocked_state.keys_manager.get_secure_random_bytes());
+        let payment_hash_inner = Sha256::hash(&payment_preimage.0[..]).to_byte_array();
+        let payment_id = PaymentId(payment_hash_inner);
+        let payment_hash = PaymentHash(payment_hash_inner);
 
         let route_params = RouteParameters::from_payment_params_and_value(
             PaymentParameters::for_keysend(dest_pubkey, 40, false),
@@ -2855,9 +2867,16 @@ pub(crate) async fn maker_execute(
         }
 
         let payment_preimage = unlocked_state
-            .channel_manager
-            .get_payment_preimage(swapstring.payment_hash, payment_secret)
-            .map_err(|_| APIError::MissingSwapPaymentPreimage)?;
+            .maker_swaps()
+            .get(&swapstring.payment_hash)
+            .and_then(|swap| swap.payment_preimage)
+            .or_else(|| {
+                unlocked_state
+                    .channel_manager
+                    .get_payment_preimage(swapstring.payment_hash, payment_secret)
+                    .ok()
+            })
+            .ok_or(APIError::MissingSwapPaymentPreimage)?;
 
         let swap_info = swapstring.swap_info;
 
@@ -2905,9 +2924,9 @@ pub(crate) async fn maker_execute(
             unlocked_state.channel_manager.get_our_node_id(),
             taker_pk,
             if swap_info.is_to_btc() {
-                Some(swap_info.qty_to + HTLC_MIN_MSAT)
+                Some(swap_info.qty_to + RGB_HTLC_MIN_MSAT)
             } else {
-                Some(HTLC_MIN_MSAT)
+                Some(RGB_HTLC_MIN_MSAT)
             },
             rgb_payment,
             vec![],
@@ -2923,9 +2942,9 @@ pub(crate) async fn maker_execute(
             taker_pk,
             unlocked_state.channel_manager.get_our_node_id(),
             if swap_info.is_to_btc() || swap_info.is_asset_asset() {
-                Some(HTLC_MIN_MSAT)
+                Some(RGB_HTLC_MIN_MSAT)
             } else {
-                Some(swap_info.qty_from + HTLC_MIN_MSAT)
+                Some(swap_info.qty_from + RGB_HTLC_MIN_MSAT)
             },
             rgb_payment,
             receive_hints,
@@ -3047,6 +3066,24 @@ pub(crate) async fn maker_execute(
     .await
 }
 
+fn parse_payment_hash(value: &str) -> Result<PaymentHash, APIError> {
+    hex_str_to_vec(value)
+        .and_then(|data| data.try_into().ok())
+        .map(PaymentHash)
+        .ok_or_else(|| APIError::InvalidPaymentHash(value.to_string()))
+}
+
+fn parse_payment_preimage(value: &str) -> Result<PaymentPreimage, APIError> {
+    hex_str_to_vec(value)
+        .and_then(|data| data.try_into().ok())
+        .map(PaymentPreimage)
+        .ok_or_else(|| APIError::InvalidRequest(s!("invalid payment_preimage")))
+}
+
+fn payment_hash_from_preimage(payment_preimage: &PaymentPreimage) -> PaymentHash {
+    PaymentHash(Sha256::hash(&payment_preimage.0).to_byte_array())
+}
+
 pub(crate) async fn maker_init(
     State(state): State<Arc<AppState>>,
     WithRejection(Json(payload), _): WithRejection<Json<MakerInitRequest>, APIError>,
@@ -3090,7 +3127,44 @@ pub(crate) async fn maker_init(
             qty_to,
             expiry,
         };
-        let swap_data = SwapData::create_from_swap_info(&swap_info);
+        let requested_payment_hash = payload
+            .payment_hash
+            .as_deref()
+            .map(parse_payment_hash)
+            .transpose()?;
+        let requested_payment_preimage = payload
+            .payment_preimage
+            .as_deref()
+            .map(parse_payment_preimage)
+            .transpose()?;
+        let requested_payment_hash = match (requested_payment_hash, requested_payment_preimage) {
+            (Some(payment_hash), Some(payment_preimage)) => {
+                let derived_hash = payment_hash_from_preimage(&payment_preimage);
+                if derived_hash != payment_hash {
+                    return Err(APIError::InvalidSwap(s!(
+                        "payment_preimage does not match payment_hash"
+                    )));
+                }
+                Some((payment_hash, payment_preimage))
+            }
+            (None, Some(payment_preimage)) => Some((
+                payment_hash_from_preimage(&payment_preimage),
+                payment_preimage,
+            )),
+            (Some(_), None) => {
+                return Err(APIError::InvalidSwap(s!(
+                    "payment_preimage is required when payment_hash is supplied"
+                )));
+            }
+            (None, None) => None,
+        };
+
+        let swap_data = SwapData::create_from_swap_info_with_preimage(
+            &swap_info,
+            requested_payment_hash
+                .as_ref()
+                .map(|(_, preimage)| *preimage),
+        );
 
         // Check that we have enough assets to send
         if let Some(to_asset) = to_asset {
@@ -3104,10 +3178,25 @@ pub(crate) async fn maker_init(
             }
         }
 
-        let (payment_hash, payment_secret) = unlocked_state
-            .channel_manager
-            .create_inbound_payment(Some(DUST_LIMIT_MSAT), payload.timeout_sec, None)
-            .unwrap();
+        let (payment_hash, payment_secret, payment_preimage) =
+            if let Some((payment_hash, payment_preimage)) = requested_payment_hash {
+                let payment_secret = unlocked_state
+                    .channel_manager
+                    .create_inbound_payment_for_hash(
+                        payment_hash,
+                        Some(DUST_LIMIT_MSAT),
+                        payload.timeout_sec,
+                        None,
+                    )
+                    .unwrap();
+                (payment_hash, payment_secret, Some(payment_preimage))
+            } else {
+                let (payment_hash, payment_secret) = unlocked_state
+                    .channel_manager
+                    .create_inbound_payment(Some(DUST_LIMIT_MSAT), payload.timeout_sec, None)
+                    .unwrap();
+                (payment_hash, payment_secret, None)
+            };
         unlocked_state.add_maker_swap(payment_hash, swap_data);
 
         let swapstring = SwapString::from_swap_info(&swap_info, payment_hash).to_string();
@@ -3117,6 +3206,7 @@ pub(crate) async fn maker_init(
         Ok(Json(MakerInitResponse {
             payment_hash,
             payment_secret,
+            payment_preimage: payment_preimage.map(|p| hex_str(&p.0)),
             swapstring,
         }))
     })
@@ -3186,7 +3276,7 @@ pub(crate) async fn node_info(
         account_xpub_vanilla: unlocked_state.rgb_get_keys().account_xpub_vanilla,
         account_xpub_colored: unlocked_state.rgb_get_keys().account_xpub_colored,
         max_media_upload_size_mb: state.static_state.max_media_upload_size_mb,
-        rgb_htlc_min_msat: HTLC_MIN_MSAT,
+        rgb_htlc_min_msat: RGB_HTLC_MIN_MSAT,
         rgb_channel_capacity_min_sat: OPENRGBCHANNEL_MIN_SAT,
         channel_capacity_min_sat: OPENCHANNEL_MIN_SAT,
         channel_capacity_max_sat: OPENCHANNEL_MAX_SAT,
@@ -3312,6 +3402,13 @@ pub(crate) async fn open_channel(
         if let Some(fee_proportional_millionths) = payload.fee_proportional_millionths {
             channel_config.forwarding_fee_proportional_millionths = fee_proportional_millionths;
         }
+        channel_config.max_dust_htlc_exposure =
+            MaxDustHTLCExposure::FixedLimitMsat(MAX_DUST_HTLC_EXPOSURE_MSAT);
+        let htlc_minimum_msat = if colored_info.is_some() {
+            RGB_HTLC_MIN_MSAT
+        } else {
+            VANILLA_HTLC_MIN_MSAT
+        };
         let config = UserConfig {
             channel_handshake_limits: ChannelHandshakeLimits {
                 // lnd's max to_self_delay is 2016, so we want to be compatible.
@@ -3320,7 +3417,7 @@ pub(crate) async fn open_channel(
             },
             channel_handshake_config: ChannelHandshakeConfig {
                 announce_for_forwarding: payload.public,
-                our_htlc_minimum_msat: HTLC_MIN_MSAT,
+                our_htlc_minimum_msat: htlc_minimum_msat,
                 minimum_depth: MIN_CHANNEL_CONFIRMATIONS as u32,
                 negotiate_anchors_zero_fee_htlc_tx: payload.with_anchors,
                 ..Default::default()

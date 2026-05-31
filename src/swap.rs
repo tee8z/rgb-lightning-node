@@ -1,4 +1,7 @@
-use lightning::{impl_writeable_tlv_based, types::payment::PaymentHash};
+use lightning::{
+    impl_writeable_tlv_based,
+    types::payment::{PaymentHash, PaymentPreimage},
+};
 use rgb_lib::ContractId;
 use std::convert::TryInto;
 use std::fmt;
@@ -16,6 +19,7 @@ pub(crate) struct SwapData {
     pub(crate) requested_at: u64,
     pub(crate) initiated_at: Option<u64>,
     pub(crate) completed_at: Option<u64>,
+    pub(crate) payment_preimage: Option<PaymentPreimage>,
 }
 
 impl_writeable_tlv_based!(SwapData, {
@@ -24,16 +28,25 @@ impl_writeable_tlv_based!(SwapData, {
     (2, requested_at, required),
     (3, initiated_at, option),
     (4, completed_at, option),
+    (5, payment_preimage, option),
 });
 
 impl SwapData {
     pub(crate) fn create_from_swap_info(swap_info: &SwapInfo) -> Self {
+        Self::create_from_swap_info_with_preimage(swap_info, None)
+    }
+
+    pub(crate) fn create_from_swap_info_with_preimage(
+        swap_info: &SwapInfo,
+        payment_preimage: Option<PaymentPreimage>,
+    ) -> Self {
         Self {
             swap_info: swap_info.clone(),
             status: SwapStatus::Waiting,
             requested_at: get_current_timestamp(),
             initiated_at: None,
             completed_at: None,
+            payment_preimage,
         }
     }
 }

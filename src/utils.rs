@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ldk::{ChannelIdsMap, Router};
 use crate::rgb::{get_rgb_channel_info_optional, RgbLibWalletWrapper};
-use crate::routes::{DEFAULT_FINAL_CLTV_EXPIRY_DELTA, HTLC_MIN_MSAT};
+use crate::routes::{DEFAULT_FINAL_CLTV_EXPIRY_DELTA, RGB_HTLC_MIN_MSAT, VANILLA_HTLC_MIN_MSAT};
 use crate::{
     args::UserArgs,
     disk::FilesystemLogger,
@@ -449,11 +449,16 @@ pub(crate) fn get_route(
         previously_failed_channels: vec![],
         previously_failed_blinded_path_idxs: vec![],
     };
+    let default_final_value_msat = if rgb_payment.is_some() {
+        RGB_HTLC_MIN_MSAT
+    } else {
+        VANILLA_HTLC_MIN_MSAT
+    };
     let route = router.find_route(
         &start,
         &RouteParameters {
             payment_params,
-            final_value_msat: final_value_msat.unwrap_or(HTLC_MIN_MSAT),
+            final_value_msat: final_value_msat.unwrap_or(default_final_value_msat),
             max_total_routing_fee_msat: None,
             rgb_payment,
         },

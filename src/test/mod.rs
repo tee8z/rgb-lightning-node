@@ -1145,6 +1145,8 @@ async fn maker_init(
         from_asset: from_asset.map(|a| a.into()),
         to_asset: to_asset.map(|a| a.into()),
         timeout_sec,
+        payment_hash: None,
+        payment_preimage: None,
     };
     let res = reqwest::Client::new()
         .post(format!("http://{node_address}/makerinit"))
