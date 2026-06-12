@@ -43,7 +43,10 @@ use lightning::routing::router::DefaultRouter;
 use lightning::routing::scoring::{ProbabilisticScorer, ProbabilisticScoringFeeParameters};
 use lightning::sign::{KeysManager, NodeSigner, OutputSpender, SpendableOutputDescriptor};
 use lightning::types::payment::{PaymentHash, PaymentPreimage};
-use lightning::util::config::UserConfig;
+use lightning::util::config::{
+    ChannelConfigOverrides, ChannelConfigUpdate, ChannelHandshakeConfigUpdate, MaxDustHTLCExposure,
+    UserConfig,
+};
 use lightning::util::hash_tables::hash_map::Entry;
 use lightning::util::hash_tables::{new_hash_map, HashMap as LdkHashMap};
 use lightning::util::persist::{
@@ -103,8 +106,9 @@ use tokio::task::JoinHandle;
 use crate::bitcoind::BitcoindClient;
 use crate::chain_backend::ChainBackend;
 use crate::core_types::{
-    HTLCStatus, NodeKeySource, SwapStatus, UnlockRequest, DUST_LIMIT_MSAT, FEE_RATE, HTLC_MIN_MSAT,
-    MIN_CHANNEL_CONFIRMATIONS,
+    HTLCStatus, NodeKeySource, SwapStatus, UnlockRequest, DUST_LIMIT_MSAT, FEE_RATE,
+    MAX_DUST_HTLC_EXPOSURE_MSAT, MIN_CHANNEL_CONFIRMATIONS, RGB_HTLC_MIN_MSAT,
+    VANILLA_HTLC_MIN_MSAT,
 };
 use crate::database::RlnDatabase;
 use crate::disk::{self, FilesystemLogger};
@@ -1154,9 +1158,14 @@ impl AsyncOrderInvoiceProvider for AsyncOrderRecipientInvoiceProvider {
     ) -> Result<AsyncOrderOutboundInvoiceResultWire, JsonRpcErrorWire> {
         let hash_index = Self::parse_u64_field(&params.hash_index, "hash_index")?;
         let amount_msat = params.amount_msat;
-        if amount_msat < HTLC_MIN_MSAT {
+        let htlc_min_msat = if params.asset_amount.is_some() {
+            RGB_HTLC_MIN_MSAT
+        } else {
+            VANILLA_HTLC_MIN_MSAT
+        };
+        if amount_msat < htlc_min_msat {
             return Err(JsonRpcErrorWire::invalid_params(format!(
-                "amt_msat cannot be less than {HTLC_MIN_MSAT}"
+                "amt_msat cannot be less than {htlc_min_msat}"
             )));
         }
         if matches!(params.asset_amount, Some(0)) {
@@ -2344,7 +2353,20 @@ async fn handle_ldk_events(
                                 temporary_channel_id,
                                 counterparty_node_id,
                                 user_channel_id,
-                                None,
+                                Some(ChannelConfigOverrides {
+                                    handshake_overrides: Some(ChannelHandshakeConfigUpdate {
+                                        htlc_minimum_msat: Some(VANILLA_HTLC_MIN_MSAT),
+                                        ..Default::default()
+                                    }),
+                                    update_overrides: Some(ChannelConfigUpdate {
+                                        max_dust_htlc_exposure_msat: Some(
+                                            MaxDustHTLCExposure::FixedLimitMsat(
+                                                MAX_DUST_HTLC_EXPOSURE_MSAT,
+                                            ),
+                                        ),
+                                        ..Default::default()
+                                    }),
+                                }),
                                 ChannelFundingType::Virtual,
                             ),
                         true,
@@ -2356,7 +2378,20 @@ async fn handle_ldk_events(
                         temporary_channel_id,
                         counterparty_node_id,
                         user_channel_id,
-                        None,
+                        Some(ChannelConfigOverrides {
+                            handshake_overrides: Some(ChannelHandshakeConfigUpdate {
+                                htlc_minimum_msat: Some(VANILLA_HTLC_MIN_MSAT),
+                                ..Default::default()
+                            }),
+                            update_overrides: Some(ChannelConfigUpdate {
+                                max_dust_htlc_exposure_msat: Some(
+                                    MaxDustHTLCExposure::FixedLimitMsat(
+                                        MAX_DUST_HTLC_EXPOSURE_MSAT,
+                                    ),
+                                ),
+                                ..Default::default()
+                            }),
+                        }),
                     ),
                     true,
                 )
@@ -3748,6 +3783,9 @@ pub(crate) async fn start_ldk(
     user_config
         .channel_handshake_config
         .negotiate_anchors_zero_fee_htlc_tx = true;
+    user_config.channel_handshake_config.our_htlc_minimum_msat = VANILLA_HTLC_MIN_MSAT;
+    user_config.channel_config.max_dust_htlc_exposure =
+        MaxDustHTLCExposure::FixedLimitMsat(MAX_DUST_HTLC_EXPOSURE_MSAT);
     user_config.accept_forwards_to_priv_channels = static_state.enable_virtual_channels_v0;
     user_config.manually_accept_inbound_channels = true;
     let mut restarting_node = true;

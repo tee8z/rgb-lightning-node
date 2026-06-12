@@ -37,7 +37,9 @@ use tokio::sync::{Mutex as TokioMutex, MutexGuard as TokioMutexGuard};
 use tokio_util::sync::CancellationToken;
 
 use crate::async_order::{AsyncOrderMessageHandler, AsyncPaymentsPreimageRoot};
-use crate::core_types::{DEFAULT_FINAL_CLTV_EXPIRY_DELTA, HTLC_MIN_MSAT};
+use crate::core_types::{
+    DEFAULT_FINAL_CLTV_EXPIRY_DELTA, RGB_HTLC_MIN_MSAT, VANILLA_HTLC_MIN_MSAT,
+};
 use crate::ldk::{ChannelIdsMap, Router, VirtualChannelDraftStore, VirtualChannelSessionStore};
 use crate::rgb::{get_rgb_channel_info_optional, RgbLibWalletWrapper};
 use crate::signer::{
@@ -649,7 +651,11 @@ pub(crate) fn get_route(
         &start,
         &RouteParameters {
             payment_params,
-            final_value_msat: final_value_msat.unwrap_or(HTLC_MIN_MSAT),
+            final_value_msat: final_value_msat.unwrap_or(if rgb_payment.is_some() {
+                RGB_HTLC_MIN_MSAT
+            } else {
+                VANILLA_HTLC_MIN_MSAT
+            }),
             max_total_routing_fee_msat: None,
             rgb_payment,
         },

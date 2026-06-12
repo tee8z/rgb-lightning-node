@@ -7,8 +7,11 @@ pub(crate) const FEE_RATE: u64 = 7;
 pub(crate) const UTXO_SIZE_SAT: u32 = 32000;
 pub(crate) const MIN_CHANNEL_CONFIRMATIONS: u8 = 6;
 pub(crate) const DUST_LIMIT_MSAT: u64 = 546000;
-pub(crate) const HTLC_MIN_MSAT: u64 = 3_000_000;
-pub(crate) const MAX_SWAP_FEE_MSAT: u64 = HTLC_MIN_MSAT;
+pub(crate) const VANILLA_HTLC_MIN_MSAT: u64 = 1;
+pub(crate) const RGB_HTLC_MIN_MSAT: u64 = 3_000_000;
+pub(crate) const HTLC_MIN_MSAT: u64 = RGB_HTLC_MIN_MSAT;
+pub(crate) const MAX_DUST_HTLC_EXPOSURE_MSAT: u64 = 10_000_000;
+pub(crate) const MAX_SWAP_FEE_MSAT: u64 = RGB_HTLC_MIN_MSAT;
 pub(crate) const DEFAULT_FINAL_CLTV_EXPIRY_DELTA: u32 = 14;
 
 pub mod async_order {
